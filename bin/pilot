@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# pilot , Project Pilot CLI. Single writer for ./briefs/<slug>/brief.md.
+#
+# Project Pilot is a small system for planning multi-week projects, displaying
+# them visually, breaking them into phases, and handing phases off to AI
+# assistants to execute. The CLI is the only writer of project briefs.
+#
+# Conventions:
+# - Briefs root: $PILOT_ROOT or ./briefs in the current working directory.
+# - One file per project: ./briefs/<slug>/brief.md.
+# - brief.md contains YAML frontmatter, projected human sections, optional
+#   ## Notes (hand-authored), and a fenced ```project-state``` JSON block.
+# - The JSON block is the source of truth. Everything else is a projection.
+# - This CLI is the only writer. Concurrent sessions are safe via mkdir locks.
+
+set -euo pipefail
+
+PILOT_VERSION="0.1.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PILOT_ROOT="${PILOT_ROOT:-$PWD/briefs}"
+
+mkdir -p "$PILOT_ROOT"
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+_state_read() {
+  awk '/^```project-state$/{f=1;next} /^```$/{if(f)exit} f' "$1/brief.md"
+}
+
+_lock() {
+  local d="$1" l="$d/.locks/project.lock"
+  mkdir -p "$d/.locks"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if mkdir "$l" 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  echo "pilot: could not acquire lock on $d" >&2
+  return 1
+}
+_unlock() { rm -rf "$1/.locks/project.lock" 2>/dev/null || true; }
+
+_state_write() {
+  local d="$1" j="$2" tmp
+  tmp="$(mktemp "$d/.brief.XXXXXX")"
+  {
+    awk '/^```project-state$/{exit} {print}' "$d/brief.md" 2>/dev/null \
+      || cat "$d/brief.md.frontmatter" 2>/dev/null
+    printf '\n```project-state\n%s\n```\n' "$(jq -S . <<<"$j")"
+  } > "$tmp"
+  mv "$tmp" "$d/brief.md"
+}
+
+_apply() {
+  local d="$1"; shift
+  local jqexpr="$1"; shift
+  _lock "$d" || return 1
+  local s n
+  s="$(_state_read "$d")"
+  n="$(jq "$jqexpr" "$@" <<<"$s")"
+  n="$(jq --arg t "$(_now)" '.updated=$t' <<<"$n")"
+  _state_write "$d" "$n"
+  _rebuild_projections "$d" "$n"
+  _unlock "$d"
+}
+
+_rebuild_projections() {
+  local d="$1" j="$2" tmp
+  tmp="$(mktemp "$d/.brief.proj.XXXXXX")"
+  {
+    awk '/^---$/{n++;if(n==2){print;exit};print;next} n<2{print}' "$d/brief.md"
+    echo
+    echo "## Goal"
+    jq -r '.goal // ""' <<<"$j"
+    echo
+    echo "## Definition of done"
+    jq -r '(.definition_of_done // [])|map("- " + .)|.[]' <<<"$j"
+    echo
+    echo "## Phases"
+    jq -r '(.phases // [])[] | "- \(.id) \(.title) [\(.executor // "me")] \(.status)"' <<<"$j"
+    echo
+    awk '/^## Notes$/{p=1} p{print}' "$d/brief.md" 2>/dev/null \
+      | awk '/^```project-state$/{exit} {print}'
+    printf '\n```project-state\n%s\n```\n' "$(jq -S . <<<"$j")"
+  } > "$tmp"
+  mv "$tmp" "$d/brief.md"
+}
+
+_jsonish() { jq empty >/dev/null 2>&1 <<<"$1"; }
+
+# ── verbs ───────────────────────────────────────────────────────────────────
+
+_init() {  # slug title [tier]
+  local slug="$1" title="$2" tier="${3:-standard}"
+  local d="$PILOT_ROOT/$slug"
+  if [[ -e "$d/brief.md" ]]; then
+    echo "pilot init: '$slug' already exists" >&2; return 1
+  fi
+  mkdir -p "$d/.locks"
+  local now; now="$(_now)"
+  cat > "$d/brief.md" <<EOF
+---
+slug: $slug
+title: $title
+tier: $tier
+status: active
+created: $(date -u +%F)
+---
+## Notes
+EOF
+  local j
+  j="$(jq -n --arg s "$slug" --arg t "$title" --arg tr "$tier" --arg n "$now" \
+    '{schema_version:1,slug:$s,title:$t,tier:$tr,project_status:"active",
+      goal:"",definition_of_done:[],created:$n,updated:$n,
+      phases:[],metadata:{}}')"
+  _lock "$d"
+  _state_write "$d" "$j"
+  _rebuild_projections "$d" "$j"
+  _unlock "$d"
+  echo "$d/brief.md"
+}
+
+_set_project() {  # slug field value
+  local d="$PILOT_ROOT/$1" f="$2" v="$3"
+  if _jsonish "$v"; then
+    _apply "$d" '.[$f]=$val' --arg f "$f" --argjson val "$v"
+  else
+    _apply "$d" '.[$f]=$val' --arg f "$f" --arg val "$v"
+  fi
+}
+
+_add_phase() {  # slug phase-json
+  local d="$PILOT_ROOT/$1"
+  local merged
+  merged="$(jq -n --argjson p "$2" '
+    {id:$p.id,title:($p.title//$p.id),outcome:($p.outcome//""),
+     acceptance_criteria:($p.acceptance_criteria//[]),
+     owner:($p.owner//"me"),executor:($p.executor//"me"),
+     status:"todo",depends_on:($p.depends_on//[]),
+     dates:($p.dates//{}),note:null,
+     last_status_change:null,completed_at:null}')"
+  _apply "$d" '.phases += [$ph]' --argjson ph "$merged"
+}
+
+_status() {  # slug phase state [note]
+  local d="$PILOT_ROOT/$1" ph="$2" st="$3" note="${4:-}"
+  _apply "$d" '
+    .phases |= map(if .id==$p then
+        .status=$s | .last_status_change=$n
+      | .note=(if $note=="" then null else $note end)
+      | (if $s=="done" then .completed_at=$n else . end)
+      else . end)' \
+    --arg p "$ph" --arg s "$st" --arg n "$(_now)" --arg note "$note"
+}
+
+_validate() {  # slug
+  local d="$PILOT_ROOT/$1" j
+  j="$(_state_read "$d")"
+  local errs=()
+  [[ -n "$(jq -r '.goal' <<<"$j")" ]] || errs+=("goal is empty")
+  [[ "$(jq '.definition_of_done|length' <<<"$j")" -gt 0 ]] || errs+=("definition_of_done is empty")
+  [[ "$(jq '.phases|length' <<<"$j")" -gt 0 ]] || errs+=("no phases")
+  while IFS= read -r p; do
+    local ex; ex="$(jq -r '.executor' <<<"$p")"
+    if [[ "$ex" != "me" ]] && [[ "$(jq '.acceptance_criteria|length' <<<"$p")" -eq 0 ]]; then
+      errs+=("phase $(jq -r .id <<<"$p"): executor=$ex requires acceptance_criteria")
+    fi
+  done < <(jq -c '.phases[]' <<<"$j")
+  if [[ ${#errs[@]} -eq 0 ]]; then echo "ok"; else printf '%s\n' "${errs[@]}" >&2; return 2; fi
+}
+
+_show() {  # slug
+  local d="$PILOT_ROOT/$1"
+  [[ -f "$d/brief.md" ]] || { echo "pilot show: '$1' not found" >&2; return 1; }
+  awk '/^```project-state$/{exit} {print}' "$d/brief.md"
+}
+
+_list() {
+  local d j
+  for d in "$PILOT_ROOT"/*/; do
+    [[ -f "$d/brief.md" ]] || continue
+    j="$(_state_read "$d" 2>/dev/null || echo '{}')"
+    local slug status done_n total_n
+    slug="$(basename "$d")"
+    status="$(jq -r '.project_status // "active"' <<<"$j")"
+    done_n="$(jq '[.phases[]?|select(.status=="done")]|length' <<<"$j" 2>/dev/null || echo 0)"
+    total_n="$(jq '.phases|length // 0' <<<"$j" 2>/dev/null || echo 0)"
+    printf '%-30s %-10s %s/%s\n' "$slug" "$status" "$done_n" "$total_n"
+  done
+}
+
+_render() {  # slug [view]
+  local d="$PILOT_ROOT/$1" view="${2:-checklist}" j
+  j="$(_state_read "$d")"
+  case "$view" in
+    checklist) jq -r '.phases[]|"- [\(if .status=="done" then "x" else " " end)] \(.id) \(.title)"' <<<"$j" ;;
+    kanban)
+      local st
+      for st in todo doing blocked needs-decision done cancelled; do
+        echo "### $st"
+        jq -r --arg s "$st" '.phases[]|select(.status==$s)|"- \(.id) \(.title)"' <<<"$j"
+      done ;;
+    flowchart)
+      echo '```mermaid'; echo 'flowchart TD'
+      jq -r '.phases[]|.id as $i|((.depends_on[]?|"  \(.) --> \($i)"),"  \($i)[\(.title)]")' <<<"$j"
+      echo '```' ;;
+    html)
+      local script="$SCRIPT_DIR/scripts/render_html.py"
+      [[ -x "$script" ]] || { echo "pilot render html: missing $script" >&2; return 2; }
+      python3 "$script" "$d/brief.md" -o "$d/plan.html" && echo "$d/plan.html" ;;
+    *) echo "pilot render: unknown view '$view'" >&2; return 2 ;;
+  esac
+}
+
+_open() {  # slug , render if stale, ensure server, open + print URL
+  local d="$PILOT_ROOT/$1"
+  [[ -f "$d/brief.md" ]] || { echo "pilot open: '$1' not found" >&2; return 1; }
+  local plan="$d/plan.html"
+  local script="$SCRIPT_DIR/scripts/render_html.py"
+  if [[ ! -f "$plan" ]] || [[ "$d/brief.md" -nt "$plan" ]]; then
+    python3 "$script" "$d/brief.md" -o "$plan" || return $?
+  fi
+  local server="$SCRIPT_DIR/scripts/pilot-server.sh"
+  local base url
+  if [[ -x "$server" ]]; then
+    PILOT_ROOT="$PILOT_ROOT" bash "$server" start >/dev/null 2>&1 || true
+    base="$(bash "$server" url 2>/dev/null || echo "")"
+  fi
+  if [[ -n "${base:-}" ]]; then
+    url="${base}/$1/plan.html"
+    command -v open >/dev/null && open "$url" 2>/dev/null
+    command -v xdg-open >/dev/null && xdg-open "$url" 2>/dev/null
+    echo "$url"
+  else
+    echo "$plan"
+  fi
+}
+
+# ── dispatch hint (no execution; brand-agnostic) ────────────────────────────
+
+_hint() {  # slug phase , prints the dispatch instruction for executor
+  local d="$PILOT_ROOT/$1" ph="$2"
+  local p
+  p="$(_state_read "$d" | jq -c --arg p "$ph" '.phases[]|select(.id==$p)')"
+  [[ -n "$p" ]] || { echo "pilot hint: no phase $ph" >&2; return 2; }
+  local ex; ex="$(jq -r '.executor' <<<"$p")"
+  local outcome accept
+  outcome="$(jq -r '.outcome' <<<"$p")"
+  accept="$(jq -r '.acceptance_criteria | map("- " + .) | join("\n")' <<<"$p")"
+
+  case "$ex" in
+    me)
+      echo "Phase $ph is yours. When done: pilot status $1 $ph done \"<evidence>\""
+      ;;
+    claude|codex|aider|*)
+      echo "Phase $ph is assigned to executor=$ex."
+      echo
+      echo "Prompt to hand the executor:"
+      echo "---"
+      echo "Work on phase $ph of the project '$1'."
+      echo
+      echo "Outcome: $outcome"
+      echo
+      echo "Acceptance criteria:"
+      echo "$accept"
+      echo
+      echo "When the criteria are met, run: pilot status $1 $ph done \"<short evidence>\""
+      echo "---"
+      ;;
+  esac
+}
+
+# ── argv router ─────────────────────────────────────────────────────────────
+
+verb="${1:-}"; shift || true
+case "$verb" in
+  --version|-v) echo "$PILOT_VERSION" ;;
+  init)        _init "$@" ;;
+  set-project) _set_project "$@" ;;
+  add-phase)   _add_phase "$@" ;;
+  status)      _status "$@" ;;
+  validate)    _validate "$@" ;;
+  show)        _show "$@" ;;
+  list|"")     _list ;;
+  render)      _render "$@" ;;
+  open)        _open "$@" ;;
+  hint)        _hint "$@" ;;
+  help|-h|--help)
+    cat <<EOF
+pilot $PILOT_VERSION , Project Pilot CLI
+
+Usage:
+  pilot                                    list active briefs
+  pilot init <slug> "<title>" [tier]       create a new brief
+  pilot set-project <slug> <field> <value> set goal, DoD, metadata
+  pilot add-phase <slug> '<json>'          append a phase
+  pilot status <slug> <phase> <state>      transition a phase
+  pilot validate <slug>                    check brief is well-formed
+  pilot show <slug>                        print brief (terminal)
+  pilot render <slug> [view]               checklist | kanban | flowchart | html
+  pilot open <slug>                        render + open plan.html in browser
+  pilot hint <slug> <phase>                print the dispatch instruction
+
+Briefs live under: $PILOT_ROOT
+Set PILOT_ROOT to override.
+EOF
+    ;;
+  *) echo "pilot: unknown verb '$verb' (try: pilot help)" >&2; exit 2 ;;
+esac
