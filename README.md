@@ -78,6 +78,10 @@ scripts/render_html.py       brief.md → plan.html via templates/plan.html.tmpl
 scripts/pilot-server.sh      127.0.0.1:8765 static server, no cache, no listing
 ```
 
+The file format is specified in [`PROTOCOL.md`](PROTOCOL.md). The `pilot` CLI
+in this repo is the reference implementation; alternate implementations
+(Codex client, web dashboard, cron worker, IDE plugin) are encouraged.
+
 Five invariants:
 
 1. The fenced `project-state` JSON block is the single source of truth.
