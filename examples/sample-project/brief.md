@@ -21,7 +21,7 @@ Ship a personal landing page at yourname.com in 2 weeks. One page, no CMS.
 - p3 Analytics + verification [me] todo
 
 ## Notes
-This is an illustrative brief. Run `pm open sample-project` (with
+This is an illustrative brief. Run `pilot open sample-project` (with
 `PILOT_ROOT=examples` set, or by copying this folder under your own briefs
 root) to see the rendered HTML view.
 

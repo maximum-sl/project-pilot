@@ -11,7 +11,8 @@ off to an AI assistant to execute, with status writing back automatically.
 pilot init launch "Ship the v1 launch"        # guided intake
 pilot open launch                             # opens plan in browser
 pilot status launch p1 done "shipped"         # mark a phase done
-pilot hint launch p2                          # print AI dispatch prompt
+pilot next --executor=cron --json             # list ready phases for a worker
+pilot hint launch p2 --json                   # fetch work package as JSON
 pilot                                         # list active projects
 ```
 
@@ -102,6 +103,11 @@ integrations/
 ├── claude-code/    Claude Code skill + slash command, ready to symlink
 └── codex/          (placeholder, contributions welcome)
 ```
+
+For headless / cron-style execution, see [`examples/cron-worker/`](examples/cron-worker/)
+, a ~70-line bash worker that polls for ready phases via `pilot next`, fetches
+work packages via `pilot hint --json`, runs them, and writes status back. A
+second conforming implementation of the protocol with no shared code.
 
 Don't use an AI assistant? `pilot` is a useful standalone CLI on its own.
 

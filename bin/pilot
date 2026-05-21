@@ -191,6 +191,52 @@ _list() {
   done
 }
 
+# _next , phases ready for execution.
+# A phase is "ready" when status=="todo" AND all depends_on phases are status=="done".
+# Filters: --executor=<name> to scope to a specific executor.
+# Output: tab-separated "slug<TAB>phase_id<TAB>executor<TAB>title" per line.
+# With --json: array of {slug, phase, executor, title, outcome}.
+_next() {
+  local exec_filter="" json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --executor=*) exec_filter="${1#--executor=}"; shift ;;
+      --executor)   exec_filter="${2:-}"; shift 2 ;;
+      --json)       json=1; shift ;;
+      *) echo "pilot next: unknown arg '$1'" >&2; return 2 ;;
+    esac
+  done
+
+  local d slug j out
+  out="$(
+    for d in "$PILOT_ROOT"/*/; do
+      [[ -f "$d/brief.md" ]] || continue
+      j="$(_state_read "$d" 2>/dev/null || echo '{}')"
+      [[ "$(jq -r '.project_status // "active"' <<<"$j")" == "active" ]] || continue
+      slug="$(basename "$d")"
+      jq -r --arg slug "$slug" --arg ex "$exec_filter" '
+        . as $root
+        | (.phases // [])
+        | map(select(.status == "todo"))
+        | map(select($ex == "" or .executor == $ex))
+        | map(select(
+            (.depends_on // [])
+            | all(. as $dep | $root.phases[]? | select(.id == $dep) | .status == "done")
+          ))
+        | .[]
+        | {slug: $slug, phase: .id, executor: (.executor // "me"),
+           title: (.title // ""), outcome: (.outcome // "")}
+      ' <<<"$j"
+    done
+  )"
+
+  if [[ "$json" == "1" ]]; then
+    if [[ -z "$out" ]]; then echo "[]"; else jq -s '.' <<<"$out"; fi
+  else
+    jq -r '[.slug, .phase, .executor, .title] | @tsv' <<<"$out"
+  fi
+}
+
 _render() {  # slug [view]
   local d="$PILOT_ROOT/$1" view="${2:-checklist}" j
   j="$(_state_read "$d")"
@@ -240,21 +286,36 @@ _open() {  # slug , render if stale, ensure server, open + print URL
 
 # ── dispatch hint (no execution; brand-agnostic) ────────────────────────────
 
-_hint() {  # slug phase , prints the dispatch instruction for executor
-  local d="$PILOT_ROOT/$1" ph="$2"
+_hint() {  # slug phase [--json] , prints the dispatch instruction
+  local d="$PILOT_ROOT/$1" ph="$2" mode="${3:-text}"
   local p
   p="$(_state_read "$d" | jq -c --arg p "$ph" '.phases[]|select(.id==$p)')"
   [[ -n "$p" ]] || { echo "pilot hint: no phase $ph" >&2; return 2; }
   local ex; ex="$(jq -r '.executor' <<<"$p")"
-  local outcome accept
+  local outcome accept_arr accept
   outcome="$(jq -r '.outcome' <<<"$p")"
+  accept_arr="$(jq -c '.acceptance_criteria // []' <<<"$p")"
   accept="$(jq -r '.acceptance_criteria | map("- " + .) | join("\n")' <<<"$p")"
+
+  if [[ "$mode" == "--json" ]]; then
+    local prompt
+    prompt="$(printf 'Work on phase %s of the project %s.\n\nOutcome: %s\n\nAcceptance criteria:\n%s\n\nWhen the criteria are met, run: pilot status %s %s done "<short evidence>"' \
+              "$ph" "$1" "$outcome" "$accept" "$1" "$ph")"
+    jq -n \
+      --arg slug "$1" --arg phase "$ph" --arg executor "$ex" \
+      --arg outcome "$outcome" --argjson criteria "$accept_arr" \
+      --arg prompt "$prompt" \
+      --arg status_cmd "pilot status $1 $ph done \"<short evidence>\"" \
+      '{slug:$slug,phase:$phase,executor:$executor,outcome:$outcome,
+        acceptance_criteria:$criteria,prompt:$prompt,status_command:$status_cmd}'
+    return 0
+  fi
 
   case "$ex" in
     me)
       echo "Phase $ph is yours. When done: pilot status $1 $ph done \"<evidence>\""
       ;;
-    claude|codex|aider|*)
+    claude|codex|aider|cron|*)
       echo "Phase $ph is assigned to executor=$ex."
       echo
       echo "Prompt to hand the executor:"
@@ -284,6 +345,7 @@ case "$verb" in
   validate)    _validate "$@" ;;
   show)        _show "$@" ;;
   list|"")     _list ;;
+  next)        _next "$@" ;;
   render)      _render "$@" ;;
   open)        _open "$@" ;;
   hint)        _hint "$@" ;;
@@ -292,16 +354,17 @@ case "$verb" in
 pilot $PILOT_VERSION , Project Pilot CLI
 
 Usage:
-  pilot                                    list active briefs
-  pilot init <slug> "<title>" [tier]       create a new brief
-  pilot set-project <slug> <field> <value> set goal, DoD, metadata
-  pilot add-phase <slug> '<json>'          append a phase
-  pilot status <slug> <phase> <state>      transition a phase
-  pilot validate <slug>                    check brief is well-formed
-  pilot show <slug>                        print brief (terminal)
-  pilot render <slug> [view]               checklist | kanban | flowchart | html
-  pilot open <slug>                        render + open plan.html in browser
-  pilot hint <slug> <phase>                print the dispatch instruction
+  pilot                                       list active briefs
+  pilot init <slug> "<title>" [tier]          create a new brief
+  pilot set-project <slug> <field> <value>    set goal, DoD, metadata
+  pilot add-phase <slug> '<json>'             append a phase
+  pilot status <slug> <phase> <state>         transition a phase
+  pilot validate <slug>                       check brief is well-formed
+  pilot show <slug>                           print brief (terminal)
+  pilot render <slug> [view]                  checklist | kanban | flowchart | html
+  pilot open <slug>                           render + open plan.html in browser
+  pilot next [--executor=X] [--json]          list phases ready to run
+  pilot hint <slug> <phase> [--json]          print the dispatch instruction
 
 Briefs live under: $PILOT_ROOT
 Set PILOT_ROOT to override.

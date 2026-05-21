@@ -243,7 +243,20 @@ verbs that maintain protocol compliance are:
 | `pilot show` | Read-only terminal view |
 | `pilot render` | Read-only render to other formats (markdown, HTML, mermaid) |
 | `pilot open` | Read-only browser view (renders + serves) |
-| `pilot hint` | Read-only , prints the executor handoff prompt |
+| `pilot next` | Read-only , lists phases that are ready to run (status=todo and all dependencies done). Supports `--executor=X` to filter by executor and `--json` for machine-readable output. The protocol's eligibility query. |
+| `pilot hint` | Read-only , prints the executor handoff prompt. Supports `--json` for machine-readable output. The protocol's handoff query. |
+
+For executor-conforming implementations (cron workers, IDE plugins, AI vendor
+adapters), the canonical loop is:
+
+```
+next  →  hint  →  (do the work)  →  status
+```
+
+`pilot next --json` returns ready phases (slug + phase id + executor + title +
+outcome). `pilot hint --json` returns the full work package (outcome,
+acceptance criteria, prompt, status command). `pilot status` writes back. No
+implementation needs to parse `brief.md` itself.
 
 The CLI is intentionally minimal. The interesting part is this spec.
 
